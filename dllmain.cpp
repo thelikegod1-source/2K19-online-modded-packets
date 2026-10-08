@@ -115,16 +115,29 @@ static std::vector<MemRegion> GetScanRegions()
     return regions;
 }
 
+// ─── Region scanner (SEH-safe, no C++ objects) ─────────────────────────────
+
+static int ScanRegionForRange(uintptr_t base, size_t size,
+                              float lo, float hi,
+                              uintptr_t* outAddrs, float* outVals, int maxOut)
+{
+    int count = 0;
+    __try {
+        float* ptr = (float*)base;
+        size_t n = size / sizeof(float);
+        for (size_t i = 0; i < n && count < maxOut; i++) {
+            float v = ptr[i];
+            if (v >= lo && v <= hi) {
+                outAddrs[count] = base + i * sizeof(float);
+                outVals[count] = v;
+                count++;
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return count;
+}
+
 // ─── Simple meter finder ────────────────────────────────────────────────────
-//
-// Press F5 mid-shot. We:
-//   1. Scan all memory for floats in [0.05, 0.90]
-//   2. Wait 50ms, re-read — keep only ones that went UP
-//   3. Wait 50ms again, re-read — keep only ones still going UP
-//   4. Pick the one with the steadiest rise rate
-//
-// That's it. No baseline, no R², no complex scoring. Just "which float is
-// rising steadily right now?"
 
 static uintptr_t FindMeterSimple()
 {
@@ -136,23 +149,26 @@ static uintptr_t FindMeterSimple()
     for (auto& r : regions) totalBytes += r.size;
     Log("Scanning %zu regions (%.0f MB)...", regions.size(), totalBytes / (1024.0 * 1024.0));
 
-    // Pass 1: collect all floats in [0.05, 0.90]
     struct Addr { uintptr_t a; float v; };
     std::vector<Addr> pass1;
     pass1.reserve(2000000);
 
+    const int BATCH = 65536;
+    uintptr_t batchAddrs[65536];
+    float batchVals[65536];
+
     for (auto& region : regions) {
         if (pass1.size() >= 10000000) break;
-        __try {
-            float* ptr = (float*)region.base;
-            size_t n = region.size / sizeof(float);
-            for (size_t i = 0; i < n && pass1.size() < 10000000; i++) {
-                float v = ptr[i];
-                if (v >= 0.05f && v <= 0.90f) {
-                    pass1.push_back({region.base + i * sizeof(float), v});
-                }
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        size_t off = 0;
+        while (off < region.size && pass1.size() < 10000000) {
+            size_t chunk = region.size - off;
+            if (chunk > (size_t)BATCH * 4) chunk = (size_t)BATCH * 4;
+            int found = ScanRegionForRange(region.base + off, chunk,
+                                           0.05f, 0.90f, batchAddrs, batchVals, BATCH);
+            for (int j = 0; j < found; j++)
+                pass1.push_back({batchAddrs[j], batchVals[j]});
+            off += chunk;
+        }
     }
 
     auto t1 = std::chrono::steady_clock::now();
