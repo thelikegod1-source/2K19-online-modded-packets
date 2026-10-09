@@ -1,9 +1,9 @@
 /**
  * autogreen.dll v5 — Vibration-based auto-green for NBA 2K19
  *
- * Hooks XInputSetState to detect when the game vibrates the controller.
- * 2K19 vibrates at the green release window — when vibration is detected
- * while X is held, it releases the shoot button automatically.
+ * Hooks XInputSetState with an inline trampoline to detect controller
+ * vibration. 2K19 vibrates at the green release window — when vibration
+ * is detected while X is held, it releases the shoot button.
  *
  * No memory scanning needed. Just inject, press F8 to enable, and shoot.
  *
@@ -72,7 +72,7 @@ static std::atomic<int> g_ShotsTaken{0};
 static std::atomic<bool> g_LagActive{false};
 static HANDLE g_Thread = nullptr;
 
-// ─── Vibration hook ─────────────────────────────────────────────────────────
+// ─── Vibration hook (inline trampoline) ─────────────────────────────────────
 
 typedef DWORD (WINAPI *fn_XInputSetState)(DWORD, XINPUT_VIBRATION*);
 typedef DWORD (WINAPI *fn_XInputGetState)(DWORD, XINPUT_STATE*);
@@ -82,6 +82,9 @@ static std::atomic<bool> g_VibrationDetected{false};
 static std::atomic<WORD> g_LastLeftMotor{0};
 static std::atomic<WORD> g_LastRightMotor{0};
 static bool g_Hooked = false;
+
+static BYTE g_OrigBytes[14] = {};
+static BYTE* g_Trampoline = nullptr;
 
 static DWORD WINAPI HookedXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
 {
@@ -97,51 +100,47 @@ static DWORD WINAPI HookedXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pV
     return g_OrigSetState(dwUserIndex, pVibration);
 }
 
-// ─── IAT patcher ────────────────────────────────────────────────────────────
-
-static bool PatchIAT(HMODULE hModule, const char* targetDll,
-                     const char* funcName, void* hookFunc, void** origFunc)
+// Inline hook: overwrites first bytes of target function with a jump to our hook.
+// Saves the original bytes in a trampoline so we can still call the original.
+static bool InlineHook(void* targetFunc, void* hookFunc, fn_XInputSetState* origOut)
 {
-    __try {
-        BYTE* base = (BYTE*)hModule;
-        auto dos = (IMAGE_DOS_HEADER*)base;
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-        auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
-        auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-        if (!dir.VirtualAddress) return false;
+    BYTE* target = (BYTE*)targetFunc;
 
-        for (auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); imp->Name; imp++) {
-            if (_stricmp((const char*)(base + imp->Name), targetDll) != 0) continue;
+    // Allocate executable memory for trampoline
+    g_Trampoline = (BYTE*)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE,
+                                        PAGE_EXECUTE_READWRITE);
+    if (!g_Trampoline) return false;
 
-            IMAGE_THUNK_DATA* origThunk = imp->OriginalFirstThunk
-                ? (IMAGE_THUNK_DATA*)(base + imp->OriginalFirstThunk) : nullptr;
-            IMAGE_THUNK_DATA* iatThunk = (IMAGE_THUNK_DATA*)(base + imp->FirstThunk);
+    // Save original bytes (14 bytes for a 64-bit absolute jump)
+    memcpy(g_OrigBytes, target, 14);
 
-            while (iatThunk->u1.Function) {
-                bool match = false;
-                if (origThunk && !IMAGE_SNAP_BY_ORDINAL(origThunk->u1.Ordinal)) {
-                    auto hint = (IMAGE_IMPORT_BY_NAME*)(base + origThunk->u1.AddressOfData);
-                    match = (strcmp((const char*)hint->Name, funcName) == 0);
-                }
+    // Build trampoline: original bytes + jump back to target+14
+    memcpy(g_Trampoline, g_OrigBytes, 14);
+    // JMP [rip+0] followed by 8-byte address
+    g_Trampoline[14] = 0xFF;
+    g_Trampoline[15] = 0x25;
+    *(DWORD*)(g_Trampoline + 16) = 0; // rip+0
+    *(UINT64*)(g_Trampoline + 20) = (UINT64)(target + 14);
 
-                if (match) {
-                    *origFunc = (void*)iatThunk->u1.Function;
-                    DWORD oldProtect;
-                    VirtualProtect(&iatThunk->u1.Function, sizeof(uintptr_t),
-                                   PAGE_READWRITE, &oldProtect);
-                    iatThunk->u1.Function = (uintptr_t)hookFunc;
-                    VirtualProtect(&iatThunk->u1.Function, sizeof(uintptr_t),
-                                   oldProtect, &oldProtect);
-                    return true;
-                }
+    *origOut = (fn_XInputSetState)g_Trampoline;
 
-                iatThunk++;
-                if (origThunk) origThunk++;
-            }
-        }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    return false;
+    // Overwrite target with jump to our hook
+    DWORD oldProtect;
+    VirtualProtect(target, 14, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+    // MOV RAX, hookFunc; JMP RAX  (total 12 bytes, pad with NOP NOP)
+    target[0] = 0x48; // REX.W
+    target[1] = 0xB8; // MOV RAX, imm64
+    *(UINT64*)(target + 2) = (UINT64)hookFunc;
+    target[10] = 0xFF;
+    target[11] = 0xE0; // JMP RAX
+    target[12] = 0x90; // NOP
+    target[13] = 0x90; // NOP
+
+    VirtualProtect(target, 14, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), target, 14);
+
+    return true;
 }
 
 static void InstallVibrationHook()
@@ -150,9 +149,11 @@ static void InstallVibrationHook()
 
     const char* xinputDlls[] = {"xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll"};
     const char* loadedXInput = nullptr;
+    HMODULE hXInput = NULL;
 
     for (auto dllName : xinputDlls) {
-        if (GetModuleHandleA(dllName)) { loadedXInput = dllName; break; }
+        hXInput = GetModuleHandleA(dllName);
+        if (hXInput) { loadedXInput = dllName; break; }
     }
     if (!loadedXInput) {
         Log("WARNING: No XInput DLL loaded in game");
@@ -160,33 +161,24 @@ static void InstallVibrationHook()
     }
     Log("Found XInput: %s", loadedXInput);
 
-    HMODULE mods[1024];
-    DWORD needed = 0;
-    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) return;
-
-    int count = (int)(needed / sizeof(HMODULE));
-    int patched = 0;
-    HMODULE hXInput = GetModuleHandleA(loadedXInput);
-
-    for (int i = 0; i < count; i++) {
-        if (mods[i] == g_Module || mods[i] == hXInput) continue;
-        void* orig = nullptr;
-        if (PatchIAT(mods[i], loadedXInput, "XInputSetState",
-                     (void*)HookedXInputSetState, &orig)) {
-            if (!g_OrigSetState) g_OrigSetState = (fn_XInputSetState)orig;
-            patched++;
-        }
+    // Get the actual function address
+    FARPROC pSetState = GetProcAddress(hXInput, "XInputSetState");
+    if (!pSetState) {
+        Log("WARNING: XInputSetState not found in %s", loadedXInput);
+        return;
     }
-
-    if (patched > 0) {
-        g_Hooked = true;
-        Log("XInputSetState hooked (%d modules patched)", patched);
-    } else {
-        Log("WARNING: Could not hook XInputSetState");
-    }
+    Log("XInputSetState at 0x%llX", (unsigned long long)pSetState);
 
     // Also grab XInputGetState for reading button state
     g_OrigGetState = (fn_XInputGetState)GetProcAddress(hXInput, "XInputGetState");
+
+    // Install inline hook
+    if (InlineHook((void*)pSetState, (void*)HookedXInputSetState, &g_OrigSetState)) {
+        g_Hooked = true;
+        Log("Inline hook installed on XInputSetState");
+    } else {
+        Log("WARNING: Failed to install inline hook");
+    }
 }
 
 // ─── Auto-green thread ─────────────────────────────────────────────────────
@@ -216,14 +208,7 @@ static void AutoGreenThread()
                 Log(">>> VIBRATION RELEASE #%d (motors L=%u R=%u) <<<",
                     g_ShotsTaken.load(), g_LastLeftMotor.load(), g_LastRightMotor.load());
 
-                // Release X by sending key-up event
-                INPUT input = {};
-                input.type = INPUT_KEYBOARD;
-                input.ki.wVk = 0;
-                input.ki.dwFlags = KEYEVENTF_KEYUP;
-
-                // Mask the X button temporarily by holding controller input
-                // We do this by briefly disabling XInput
+                // Release by briefly disabling XInput
                 HMODULE hXInput = nullptr;
                 const char* xinputDlls[] = {"xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll"};
                 for (auto dll : xinputDlls) {
@@ -243,8 +228,6 @@ static void AutoGreenThread()
                 }
 
                 Sleep(300);
-            } else {
-                Log("Vibration detected but X not held (menu/other vibration)");
             }
         }
         Sleep(1);
