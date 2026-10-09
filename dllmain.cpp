@@ -1,14 +1,15 @@
 /**
- * autogreen.dll v4 — Auto-green shot release for NBA 2K19
+ * autogreen.dll v5 — Vibration-based auto-green for NBA 2K19
  *
- * v4: Simplified meter finder — no baseline needed. Just press F5 mid-shot
- * and it scans ALL readable memory for floats that are rising steadily.
- * Works with MEM_IMAGE + MEM_PRIVATE + any protection that allows reads.
+ * Hooks XInputSetState to detect when the game vibrates the controller.
+ * 2K19 vibrates at the green release window — when vibration is detected
+ * while X is held, it releases the shoot button automatically.
+ *
+ * No memory scanning needed. Just inject, press F8 to enable, and shoot.
  *
  * Hotkeys:
- *   F5 = find meter (press while shot meter is filling, ~1/3 full)
- *   F8 = toggle auto-green on/off
- *   F9 = dump current state to log
+ *   F8  = toggle auto-green on/off
+ *   F9  = dump state to log
  *   F10 = toggle lag switch
  *   F12 = uninject DLL
  */
@@ -20,12 +21,12 @@
 #include <cstdarg>
 #include <cstring>
 #include <cmath>
-#include <chrono>
-#include <vector>
-#include <algorithm>
 #include <atomic>
 
 #pragma comment(lib, "psapi.lib")
+
+#include <xinput.h>
+#pragma comment(lib, "xinput.lib")
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 
@@ -67,208 +68,39 @@ static void Log(const char* fmt, ...)
 static std::atomic<bool> g_Running{true};
 static HMODULE g_Module = nullptr;
 static std::atomic<bool> g_AutoGreen{false};
-static std::atomic<uintptr_t> g_MeterAddr{0};
-static std::atomic<float> g_GreenTarget{0.50f};
-static std::atomic<float> g_FadeTarget{0.40f};
-static std::atomic<bool> g_FindRequest{false};
 static std::atomic<int> g_ShotsTaken{0};
-static std::atomic<float> g_LastReleaseVal{0};
 static std::atomic<bool> g_LagActive{false};
 static HANDLE g_Thread = nullptr;
 
-// ─── Safe memory read ───────────────────────────────────────────────────────
+// ─── Vibration hook ─────────────────────────────────────────────────────────
 
-static bool SafeReadFloat(uintptr_t addr, float* out)
-{
-    __try {
-        *out = *(volatile float*)addr;
-        return true;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-// ─── Memory regions ────────────────────────────────────────────────────────
-
-struct MemRegion { uintptr_t base; size_t size; };
-
-static std::vector<MemRegion> GetScanRegions(bool imageOnly)
-{
-    std::vector<MemRegion> regions;
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    uintptr_t addr = (uintptr_t)si.lpMinimumApplicationAddress;
-    uintptr_t maxAddr = (uintptr_t)si.lpMaximumApplicationAddress;
-
-    while (addr < maxAddr) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (VirtualQuery((void*)addr, &mbi, sizeof(mbi)) == 0) break;
-
-        if (mbi.State == MEM_COMMIT &&
-            !(mbi.Protect & PAGE_GUARD) &&
-            !(mbi.Protect & PAGE_NOACCESS) &&
-            mbi.RegionSize <= 256 * 1024 * 1024) {
-            bool isImage = (mbi.Type == MEM_IMAGE);
-            bool isRW = (mbi.Protect == PAGE_READWRITE || mbi.Protect == PAGE_WRITECOPY);
-            if (!imageOnly || (isImage && isRW)) {
-                regions.push_back({(uintptr_t)mbi.BaseAddress, mbi.RegionSize});
-            }
-        }
-        addr = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-    }
-    return regions;
-}
-
-// ─── Region scanner (SEH-safe, no C++ objects) ─────────────────────────────
-
-static int ScanRegionForRange(uintptr_t base, size_t size,
-                              float lo, float hi,
-                              uintptr_t* outAddrs, float* outVals, int maxOut)
-{
-    int count = 0;
-    __try {
-        float* ptr = (float*)base;
-        size_t n = size / sizeof(float);
-        for (size_t i = 0; i < n && count < maxOut; i++) {
-            float v = ptr[i];
-            if (v >= lo && v <= hi) {
-                outAddrs[count] = base + i * sizeof(float);
-                outVals[count] = v;
-                count++;
-            }
-        }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    return count;
-}
-
-// ─── Scan regions and collect rising floats ────────────────────────────────
-
-struct ScanAddr { uintptr_t a; float v; };
-struct ScanFinal { uintptr_t a; float v1, v2, v3; float rate; };
-
-static uintptr_t ScanAndFilter(std::vector<MemRegion>& regions, const char* label)
-{
-    auto t0 = std::chrono::steady_clock::now();
-    size_t totalBytes = 0;
-    for (auto& r : regions) totalBytes += r.size;
-    Log("[%s] Scanning %zu regions (%.0f MB)...", label, regions.size(), totalBytes / (1024.0 * 1024.0));
-
-    std::vector<ScanAddr> pass1;
-    pass1.reserve(500000);
-
-    const int BATCH = 65536;
-    uintptr_t batchAddrs[65536];
-    float batchVals[65536];
-
-    for (auto& region : regions) {
-        if (pass1.size() >= 5000000) break;
-        size_t off = 0;
-        while (off < region.size && pass1.size() < 5000000) {
-            size_t chunk = region.size - off;
-            if (chunk > (size_t)BATCH * 4) chunk = (size_t)BATCH * 4;
-            int found = ScanRegionForRange(region.base + off, chunk,
-                                           0.02f, 0.95f, batchAddrs, batchVals, BATCH);
-            for (int j = 0; j < found; j++)
-                pass1.push_back({batchAddrs[j], batchVals[j]});
-            off += chunk;
-        }
-    }
-
-    auto t1 = std::chrono::steady_clock::now();
-    Log("[%s] Pass 1: %zu floats (%.0f ms)", label,
-        pass1.size(), std::chrono::duration<double, std::milli>(t1 - t0).count());
-
-    if (pass1.empty()) return 0;
-
-    Sleep(40);
-    std::vector<ScanAddr> pass2;
-    pass2.reserve(pass1.size() / 20);
-    for (auto& p : pass1) {
-        float v2;
-        if (!SafeReadFloat(p.a, &v2)) continue;
-        if (v2 > p.v + 0.002f && v2 <= 1.0f)
-            pass2.push_back({p.a, v2});
-    }
-    Log("[%s] Pass 2: %zu rising after 40ms", label, pass2.size());
-    if (pass2.empty()) return 0;
-
-    Sleep(40);
-    std::vector<ScanFinal> finals;
-    for (auto& p : pass2) {
-        float v3;
-        if (!SafeReadFloat(p.a, &v3)) continue;
-        if (v3 > p.v + 0.002f && v3 <= 1.05f) {
-            float rate = (v3 - p.v) / 0.040f;
-            if (rate >= 0.1f && rate <= 5.0f)
-                finals.push_back({p.a, 0, p.v, v3, rate});
-        }
-    }
-    Log("[%s] Pass 3: %zu confirmed rising", label, finals.size());
-    if (finals.empty()) return 0;
-
-    std::sort(finals.begin(), finals.end(), [](const ScanFinal& a, const ScanFinal& b) {
-        float aFit = fabsf(a.rate - 0.70f);
-        float bFit = fabsf(b.rate - 0.70f);
-        return aFit < bFit;
-    });
-
-    int show = finals.size() < 10 ? (int)finals.size() : 10;
-    Log("[%s] Top candidates:", label);
-    for (int i = 0; i < show; i++) {
-        Log("  [%d] addr=0x%llX  %.3f -> %.3f  rate=%.2f/sec",
-            i, (unsigned long long)finals[i].a,
-            finals[i].v2, finals[i].v3, finals[i].rate);
-    }
-
-    auto tEnd = std::chrono::steady_clock::now();
-    Log("*** METER FOUND: addr=0x%llX (rate=%.2f/sec, %.0f ms) ***",
-        (unsigned long long)finals[0].a, finals[0].rate,
-        std::chrono::duration<double, std::milli>(tEnd - t0).count());
-    return finals[0].a;
-}
-
-// ─── Meter finder — fast game-memory scan, then fallback to all memory ─────
-
-static uintptr_t FindMeterSimple()
-{
-    Log("=== METER SCAN (F5) ===");
-
-    auto imageRegions = GetScanRegions(true);
-    if (!imageRegions.empty()) {
-        uintptr_t result = ScanAndFilter(imageRegions, "IMAGE");
-        if (result) return result;
-        Log("No meter in game image memory, trying ALL memory...");
-    }
-
-    auto allRegions = GetScanRegions(false);
-    uintptr_t result = ScanAndFilter(allRegions, "ALL");
-    if (!result)
-        Log("No meter found. Press F5 earlier while meter is filling (~1/3).");
-    return result;
-}
-
-// ─── XInput hook ────────────────────────────────────────────────────────────
-
-#include <xinput.h>
-#pragma comment(lib, "xinput.lib")
-
+typedef DWORD (WINAPI *fn_XInputSetState)(DWORD, XINPUT_VIBRATION*);
 typedef DWORD (WINAPI *fn_XInputGetState)(DWORD, XINPUT_STATE*);
-static fn_XInputGetState g_OrigXInputGetState = nullptr;
-typedef void (WINAPI *fn_XInputEnable)(BOOL);
-static fn_XInputEnable g_XInputEnable = nullptr;
-static std::atomic<bool> g_MaskShootButton{false};
-static bool g_XInputHooked = false;
+static fn_XInputSetState g_OrigSetState = nullptr;
+static fn_XInputGetState g_OrigGetState = nullptr;
+static std::atomic<bool> g_VibrationDetected{false};
+static std::atomic<WORD> g_LastLeftMotor{0};
+static std::atomic<WORD> g_LastRightMotor{0};
+static bool g_Hooked = false;
 
-static DWORD WINAPI HookedXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState)
+static DWORD WINAPI HookedXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
 {
-    DWORD ret = g_OrigXInputGetState(dwUserIndex, pState);
-    if (ret == ERROR_SUCCESS && g_MaskShootButton) {
-        pState->Gamepad.wButtons &= ~XINPUT_GAMEPAD_X;
+    if (pVibration) {
+        WORD left = pVibration->wLeftMotorSpeed;
+        WORD right = pVibration->wRightMotorSpeed;
+        g_LastLeftMotor = left;
+        g_LastRightMotor = right;
+        if ((left > 0 || right > 0) && g_AutoGreen) {
+            g_VibrationDetected = true;
+        }
     }
-    return ret;
+    return g_OrigSetState(dwUserIndex, pVibration);
 }
 
-static bool PatchModuleIAT(HMODULE hModule, const char* targetDll, void* hookFunc)
+// ─── IAT patcher ────────────────────────────────────────────────────────────
+
+static bool PatchIAT(HMODULE hModule, const char* targetDll,
+                     const char* funcName, void* hookFunc, void** origFunc)
 {
     __try {
         BYTE* base = (BYTE*)hModule;
@@ -290,11 +122,11 @@ static bool PatchModuleIAT(HMODULE hModule, const char* targetDll, void* hookFun
                 bool match = false;
                 if (origThunk && !IMAGE_SNAP_BY_ORDINAL(origThunk->u1.Ordinal)) {
                     auto hint = (IMAGE_IMPORT_BY_NAME*)(base + origThunk->u1.AddressOfData);
-                    match = (strcmp((const char*)hint->Name, "XInputGetState") == 0);
+                    match = (strcmp((const char*)hint->Name, funcName) == 0);
                 }
 
                 if (match) {
-                    g_OrigXInputGetState = (fn_XInputGetState)iatThunk->u1.Function;
+                    *origFunc = (void*)iatThunk->u1.Function;
                     DWORD oldProtect;
                     VirtualProtect(&iatThunk->u1.Function, sizeof(uintptr_t),
                                    PAGE_READWRITE, &oldProtect);
@@ -312,187 +144,110 @@ static bool PatchModuleIAT(HMODULE hModule, const char* targetDll, void* hookFun
     return false;
 }
 
-static void InstallXInputHook()
+static void InstallVibrationHook()
 {
-    if (g_XInputHooked) return;
+    if (g_Hooked) return;
 
     const char* xinputDlls[] = {"xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll"};
     const char* loadedXInput = nullptr;
-    HMODULE hXInput = NULL;
 
     for (auto dllName : xinputDlls) {
-        hXInput = GetModuleHandleA(dllName);
-        if (hXInput) { loadedXInput = dllName; break; }
+        if (GetModuleHandleA(dllName)) { loadedXInput = dllName; break; }
     }
     if (!loadedXInput) {
-        Log("WARNING: No XInput DLL loaded");
-        g_XInputEnable = nullptr;
+        Log("WARNING: No XInput DLL loaded in game");
         return;
     }
     Log("Found XInput: %s", loadedXInput);
 
     HMODULE mods[1024];
     DWORD needed = 0;
-    if (EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) {
-        int count = (int)(needed / sizeof(HMODULE));
-        int patched = 0;
-        for (int i = 0; i < count; i++) {
-            if (mods[i] == g_Module || mods[i] == hXInput) continue;
-            if (PatchModuleIAT(mods[i], loadedXInput, (void*)HookedXInputGetState)) {
-                patched++;
-            }
-        }
-        if (patched > 0) {
-            g_XInputHooked = true;
-            Log("XInput IAT hook installed (%d modules)", patched);
-        }
-    }
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) return;
 
-    if (!g_XInputHooked) {
-        g_XInputEnable = (fn_XInputEnable)GetProcAddress(hXInput, "XInputEnable");
-        if (g_XInputEnable) {
-            Log("Fallback: using XInputEnable for shot release");
-        } else {
-            Log("WARNING: No hook method available");
+    int count = (int)(needed / sizeof(HMODULE));
+    int patched = 0;
+    HMODULE hXInput = GetModuleHandleA(loadedXInput);
+
+    for (int i = 0; i < count; i++) {
+        if (mods[i] == g_Module || mods[i] == hXInput) continue;
+        void* orig = nullptr;
+        if (PatchIAT(mods[i], loadedXInput, "XInputSetState",
+                     (void*)HookedXInputSetState, &orig)) {
+            if (!g_OrigSetState) g_OrigSetState = (fn_XInputSetState)orig;
+            patched++;
         }
     }
-}
 
-// ─── Release helper ─────────────────────────────────────────────────────────
-
-static void SetReleaseMask(bool on)
-{
-    if (g_XInputHooked) {
-        g_MaskShootButton = on;
-    } else if (g_XInputEnable) {
-        g_XInputEnable(on ? FALSE : TRUE);
-    }
-}
-
-// ─── Read config files ──────────────────────────────────────────────────────
-
-static void ReadTargetConfigs()
-{
-    char path[MAX_PATH];
-
-    snprintf(path, MAX_PATH, "%s\\target.txt", g_LogDir);
-    FILE* f = fopen(path, "r");
-    if (f) {
-        float t = 0;
-        if (fscanf(f, "%f", &t) == 1 && t >= 0.15f && t <= 0.95f) {
-            if (fabsf(t - g_GreenTarget.load()) > 0.001f) {
-                g_GreenTarget = t;
-                Log("Standing target updated to %.2f", t);
-            }
-        }
-        fclose(f);
+    if (patched > 0) {
+        g_Hooked = true;
+        Log("XInputSetState hooked (%d modules patched)", patched);
+    } else {
+        Log("WARNING: Could not hook XInputSetState");
     }
 
-    snprintf(path, MAX_PATH, "%s\\fade_target.txt", g_LogDir);
-    f = fopen(path, "r");
-    if (f) {
-        float t = 0;
-        if (fscanf(f, "%f", &t) == 1 && t >= 0.15f && t <= 0.95f) {
-            if (fabsf(t - g_FadeTarget.load()) > 0.001f) {
-                g_FadeTarget = t;
-                Log("Fade target updated to %.2f", t);
-            }
-        }
-        fclose(f);
-    }
+    // Also grab XInputGetState for reading button state
+    g_OrigGetState = (fn_XInputGetState)GetProcAddress(hXInput, "XInputGetState");
 }
 
 // ─── Auto-green thread ─────────────────────────────────────────────────────
 
 static void AutoGreenThread()
 {
-    Log("=== AUTO-GREEN ACTIVE === target=%.2f", g_GreenTarget.load());
-    InstallXInputHook();
-    ReadTargetConfigs();
+    Log("=== AUTO-GREEN v5 (VIBRATION) ACTIVE ===");
+    InstallVibrationHook();
+
+    if (!g_Hooked) {
+        Log("Cannot run without vibration hook. Auto-green stopped.");
+        g_AutoGreen = false;
+        return;
+    }
 
     while (g_AutoGreen && g_Running) {
-        uintptr_t meterAddr = g_MeterAddr.load();
-
-        if (meterAddr == 0) {
-            if (g_FindRequest.exchange(false)) {
-                uintptr_t found = FindMeterSimple();
-                if (found) g_MeterAddr = found;
-            }
-            Sleep(16);
-            continue;
-        }
-
-        // === Main auto-green loop ===
-        float lastVal = 0;
-        bool released = false;
-        int staleCount = 0;
-        int zeroCount = 0;
-        int configCounter = 0;
-
-        Log("Monitoring meter at 0x%llX (standing=%.2f, fade=%.2f)...",
-            (unsigned long long)meterAddr, g_GreenTarget.load(), g_FadeTarget.load());
-
-        while (g_AutoGreen && g_Running) {
-            if (g_FindRequest.exchange(false)) {
-                uintptr_t found = FindMeterSimple();
-                if (found) {
-                    g_MeterAddr = found;
-                    meterAddr = found;
-                    Log("Meter re-found at 0x%llX", (unsigned long long)found);
-                }
-            }
-            if (++configCounter > 2000) {
-                configCounter = 0;
-                ReadTargetConfigs();
+        if (g_VibrationDetected.exchange(false)) {
+            // Vibration detected! Check if shoot button (X) is held
+            XINPUT_STATE state;
+            bool xHeld = false;
+            if (g_OrigGetState && g_OrigGetState(0, &state) == ERROR_SUCCESS) {
+                xHeld = (state.Gamepad.wButtons & XINPUT_GAMEPAD_X) != 0;
             }
 
-            float val;
-            if (!SafeReadFloat(meterAddr, &val)) { Sleep(1); continue; }
-
-            if (val >= -0.001f && val <= 0.001f) {
-                zeroCount++;
-                if (zeroCount > 50 && released) released = false;
-                continue;
-            }
-            zeroCount = 0;
-
-            if (val < 0.0f || val > 1.05f) {
-                staleCount++;
-                if (staleCount > 10000) {
-                    Log("Meter stale (val=%.4f). Press F5 during a shot to re-find.", val);
-                    g_MeterAddr = 0;
-                    break;
-                }
-                continue;
-            }
-            staleCount = 0;
-
-            if (released && lastVal > 0.01f && val < lastVal - 0.05f) {
-                released = false;
-                lastVal = 0;
-            }
-
-            float delta = (lastVal > 0.01f) ? (val - lastVal) : 0.0f;
-            bool isFade = (delta > 0.025f);
-            float target = isFade ? g_FadeTarget.load() : g_GreenTarget.load();
-
-            if (val >= target && val <= 0.95f && !released) {
-                Log(">>> %s RELEASE at %.4f (target %.2f) <<<",
-                    isFade ? "FADE" : "GREEN", val, target);
-
-                SetReleaseMask(true);
-                Sleep(100);
-                SetReleaseMask(false);
-
-                g_LastReleaseVal = val;
+            if (xHeld) {
                 g_ShotsTaken++;
-                released = true;
-                Log("Shot #%d released at %.4f", g_ShotsTaken.load(), val);
-                Sleep(300);
-            }
+                Log(">>> VIBRATION RELEASE #%d (motors L=%u R=%u) <<<",
+                    g_ShotsTaken.load(), g_LastLeftMotor.load(), g_LastRightMotor.load());
 
-            lastVal = val;
+                // Release X by sending key-up event
+                INPUT input = {};
+                input.type = INPUT_KEYBOARD;
+                input.ki.wVk = 0;
+                input.ki.dwFlags = KEYEVENTF_KEYUP;
+
+                // Mask the X button temporarily by holding controller input
+                // We do this by briefly disabling XInput
+                HMODULE hXInput = nullptr;
+                const char* xinputDlls[] = {"xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll"};
+                for (auto dll : xinputDlls) {
+                    hXInput = GetModuleHandleA(dll);
+                    if (hXInput) break;
+                }
+
+                typedef void (WINAPI *fn_XInputEnable)(BOOL);
+                fn_XInputEnable pEnable = nullptr;
+                if (hXInput) pEnable = (fn_XInputEnable)GetProcAddress(hXInput, "XInputEnable");
+
+                if (pEnable) {
+                    pEnable(FALSE);
+                    Sleep(80);
+                    pEnable(TRUE);
+                    Log("Released via XInputEnable");
+                }
+
+                Sleep(300);
+            } else {
+                Log("Vibration detected but X not held (menu/other vibration)");
+            }
         }
+        Sleep(1);
     }
     Log("Auto-green stopped");
 }
@@ -541,21 +296,9 @@ static void ToggleLag()
 
 static void HotkeyThread()
 {
-    Log("Hotkeys: F5=find meter, F8=toggle auto-green, F9=dump, F10=lag, F12=uninject");
+    Log("Hotkeys: F8=toggle auto-green, F9=dump, F10=lag, F12=uninject");
 
     while (g_Running) {
-        if (GetAsyncKeyState(VK_F5) & 1) {
-            if (g_AutoGreen) {
-                g_FindRequest = true;
-                Log("F5: meter scan requested");
-            } else {
-                uintptr_t found = FindMeterSimple();
-                if (found) {
-                    g_MeterAddr = found;
-                    Log("F5: Meter locked at 0x%llX", (unsigned long long)found);
-                }
-            }
-        }
         if (GetAsyncKeyState(VK_F8) & 1) {
             if (g_AutoGreen) {
                 g_AutoGreen = false;
@@ -565,23 +308,16 @@ static void HotkeyThread()
                 CreateThread(NULL, 0,
                     [](LPVOID) -> DWORD { AutoGreenThread(); return 0; },
                     NULL, 0, NULL);
-                Log("F8: Auto-green ENABLED (target=%.2f)", g_GreenTarget.load());
+                Log("F8: Auto-green ENABLED (vibration mode)");
             }
         }
         if (GetAsyncKeyState(VK_F9) & 1) {
             Log("=== F9: STATE DUMP ===");
-            Log("  Meter addr: 0x%llX", (unsigned long long)g_MeterAddr.load());
             Log("  Auto-green: %s", g_AutoGreen.load() ? "ON" : "OFF");
-            Log("  Target: standing=%.2f fade=%.2f", g_GreenTarget.load(), g_FadeTarget.load());
             Log("  Shots: %d", g_ShotsTaken.load());
-            Log("  Last release: %.4f", g_LastReleaseVal.load());
+            Log("  Vibration hook: %s", g_Hooked ? "YES" : "NO");
+            Log("  Last motors: L=%u R=%u", g_LastLeftMotor.load(), g_LastRightMotor.load());
             Log("  Lag switch: %s", g_LagActive.load() ? "ON" : "OFF");
-            Log("  XInput hook: %s", g_XInputHooked ? "IAT" : (g_XInputEnable ? "XInputEnable" : "NONE"));
-            uintptr_t ma = g_MeterAddr.load();
-            if (ma) {
-                float v;
-                if (SafeReadFloat(ma, &v)) Log("  Meter current value: %.4f", v);
-            }
         }
         if (GetAsyncKeyState(VK_F10) & 1) {
             ToggleLag();
@@ -612,11 +348,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(hModule);
         g_Module = hModule;
         LogInit();
-        Log("autogreen.dll v4 loaded - pid %u", GetCurrentProcessId());
+        Log("autogreen.dll v5 loaded (VIBRATION MODE) - pid %u", GetCurrentProcessId());
         g_Thread = CreateThread(NULL, 0,
             [](LPVOID) -> DWORD { HotkeyThread(); return 0; },
             NULL, 0, NULL);
-        Log("Ready! Press F8 to enable auto-green, then F5 during a shot to find the meter.");
+        Log("Ready! Press F8 to enable auto-green. No meter scan needed!");
         break;
 
     case DLL_PROCESS_DETACH:
