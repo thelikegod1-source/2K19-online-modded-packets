@@ -99,13 +99,15 @@ static std::atomic<WORD> g_LastRightMotor{0};
 
 static DWORD WINAPI MyXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
 {
-    if (pVibration && g_AutoGreen && !g_TimerMode) {
+    if (pVibration) {
         g_LastLeftMotor = pVibration->wLeftMotorSpeed;
         g_LastRightMotor = pVibration->wRightMotorSpeed;
-        if ((pVibration->wLeftMotorSpeed > 0 || pVibration->wRightMotorSpeed > 0)
-            && !g_BlockX) {
+        if (g_AutoGreen && !g_TimerMode
+            && (pVibration->wLeftMotorSpeed > 0 || pVibration->wRightMotorSpeed > 0)
+            && !g_BlockX && !g_ShotActive) {
             g_ShotsTaken++;
-            g_BlockXUntil = GetTickCount() + 100;
+            g_ShotActive = true;
+            g_BlockXUntil = GetTickCount() + 150;
             g_BlockX = true;
         }
     }
@@ -121,26 +123,31 @@ static DWORD WINAPI MyXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState)
 
     // Timer mode: detect X press start, release after delay
     if (g_TimerMode) {
-        if (xHeld && !g_XWasHeld && !g_BlockX) {
+        if (xHeld && !g_ShotActive && !g_BlockX) {
             QueryPerformanceCounter(&g_XPressTime);
-            g_XWasHeld = true;
+            g_ShotActive = true;
         }
 
-        if (g_XWasHeld && xHeld && !g_BlockX) {
+        if (g_ShotActive && xHeld && !g_BlockX) {
             LARGE_INTEGER now;
             QueryPerformanceCounter(&now);
             double elapsedMs = (double)(now.QuadPart - g_XPressTime.QuadPart)
                              / (double)g_PerfFreq.QuadPart * 1000.0;
             if (elapsedMs >= (double)g_ReleaseDelayMs.load()) {
                 g_ShotsTaken++;
-                g_BlockXUntil = GetTickCount() + 150;
+                g_BlockXUntil = GetTickCount() + 200;
                 g_BlockX = true;
             }
         }
 
-        if (!xHeld) {
-            g_XWasHeld = false;
+        if (!xHeld && !g_BlockX) {
+            g_ShotActive = false;
         }
+    }
+
+    // Vibration mode: reset shot active when X released
+    if (!g_TimerMode && !xHeld) {
+        g_ShotActive = false;
     }
 
     // Block X when flag is set (both modes)
