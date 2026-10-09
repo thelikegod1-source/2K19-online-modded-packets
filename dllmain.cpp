@@ -1,11 +1,11 @@
 /**
  * autogreen.dll v5 — Vibration-based auto-green for NBA 2K19
  *
- * Hooks XInputSetState with an inline trampoline to detect controller
- * vibration. 2K19 vibrates at the green release window — when vibration
- * is detected while X is held, it releases the shoot button.
+ * Detects controller vibration to auto-release the shoot button.
+ * 2K19 vibrates at the green release window — this catches it.
  *
- * No memory scanning needed. Just inject, press F8 to enable, and shoot.
+ * Uses EAT hook on XInputSetState + IAT hook as backup.
+ * No memory scanning needed. Just inject, press F8, and shoot.
  *
  * Hotkeys:
  *   F8  = toggle auto-green on/off
@@ -72,7 +72,7 @@ static std::atomic<int> g_ShotsTaken{0};
 static std::atomic<bool> g_LagActive{false};
 static HANDLE g_Thread = nullptr;
 
-// ─── Vibration hook (inline trampoline) ─────────────────────────────────────
+// ─── Vibration detection ────────────────────────────────────────────────────
 
 typedef DWORD (WINAPI *fn_XInputSetState)(DWORD, XINPUT_VIBRATION*);
 typedef DWORD (WINAPI *fn_XInputGetState)(DWORD, XINPUT_STATE*);
@@ -83,61 +83,104 @@ static std::atomic<WORD> g_LastLeftMotor{0};
 static std::atomic<WORD> g_LastRightMotor{0};
 static bool g_Hooked = false;
 
-static BYTE g_OrigBytes[12] = {};
-static BYTE g_HookBytes[12] = {};
-static BYTE* g_TargetFunc = nullptr;
-static CRITICAL_SECTION g_HookLock;
-
 static DWORD WINAPI HookedXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
 {
     if (pVibration) {
-        WORD left = pVibration->wLeftMotorSpeed;
-        WORD right = pVibration->wRightMotorSpeed;
-        g_LastLeftMotor = left;
-        g_LastRightMotor = right;
-        if ((left > 0 || right > 0) && g_AutoGreen) {
+        g_LastLeftMotor = pVibration->wLeftMotorSpeed;
+        g_LastRightMotor = pVibration->wRightMotorSpeed;
+        if ((pVibration->wLeftMotorSpeed > 0 || pVibration->wRightMotorSpeed > 0)
+            && g_AutoGreen) {
             g_VibrationDetected = true;
         }
     }
-
-    // Unhook, call original, rehook (safe hot-patch)
-    EnterCriticalSection(&g_HookLock);
-    DWORD oldProt;
-    VirtualProtect(g_TargetFunc, 12, PAGE_EXECUTE_READWRITE, &oldProt);
-    memcpy(g_TargetFunc, g_OrigBytes, 12);
-    FlushInstructionCache(GetCurrentProcess(), g_TargetFunc, 12);
-    DWORD result = ((fn_XInputSetState)g_TargetFunc)(dwUserIndex, pVibration);
-    memcpy(g_TargetFunc, g_HookBytes, 12);
-    FlushInstructionCache(GetCurrentProcess(), g_TargetFunc, 12);
-    VirtualProtect(g_TargetFunc, 12, oldProt, &oldProt);
-    LeaveCriticalSection(&g_HookLock);
-
-    return result;
+    return g_OrigSetState(dwUserIndex, pVibration);
 }
 
-static bool InlineHook(void* targetFunc, void* hookFunc)
+// ─── IAT patcher ────────────────────────────────────────────────────────────
+
+static bool PatchIATFunc(HMODULE hModule, const char* targetDll,
+                         const char* funcName, void* hookFunc, void** origFunc)
 {
-    g_TargetFunc = (BYTE*)targetFunc;
-    InitializeCriticalSection(&g_HookLock);
+    __try {
+        BYTE* base = (BYTE*)hModule;
+        auto dos = (IMAGE_DOS_HEADER*)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+        auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+        auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!dir.VirtualAddress) return false;
 
-    // Save original bytes
-    memcpy(g_OrigBytes, g_TargetFunc, 12);
+        for (auto imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); imp->Name; imp++) {
+            if (_stricmp((const char*)(base + imp->Name), targetDll) != 0) continue;
 
-    // Build hook jump: MOV RAX, hookFunc; JMP RAX
-    g_HookBytes[0] = 0x48;
-    g_HookBytes[1] = 0xB8;
-    *(UINT64*)(g_HookBytes + 2) = (UINT64)hookFunc;
-    g_HookBytes[10] = 0xFF;
-    g_HookBytes[11] = 0xE0;
+            IMAGE_THUNK_DATA* origThunk = imp->OriginalFirstThunk
+                ? (IMAGE_THUNK_DATA*)(base + imp->OriginalFirstThunk) : nullptr;
+            IMAGE_THUNK_DATA* iatThunk = (IMAGE_THUNK_DATA*)(base + imp->FirstThunk);
 
-    // Install
-    DWORD oldProtect;
-    VirtualProtect(g_TargetFunc, 12, PAGE_EXECUTE_READWRITE, &oldProtect);
-    memcpy(g_TargetFunc, g_HookBytes, 12);
-    VirtualProtect(g_TargetFunc, 12, oldProtect, &oldProtect);
-    FlushInstructionCache(GetCurrentProcess(), g_TargetFunc, 12);
+            while (iatThunk->u1.Function) {
+                bool match = false;
+                if (origThunk && !IMAGE_SNAP_BY_ORDINAL(origThunk->u1.Ordinal)) {
+                    auto hint = (IMAGE_IMPORT_BY_NAME*)(base + origThunk->u1.AddressOfData);
+                    match = (strcmp((const char*)hint->Name, funcName) == 0);
+                }
+                if (!match && !origThunk) {
+                    match = ((void*)iatThunk->u1.Function == *origFunc);
+                }
 
-    return true;
+                if (match) {
+                    if (!*origFunc) *origFunc = (void*)iatThunk->u1.Function;
+                    DWORD oldProtect;
+                    VirtualProtect(&iatThunk->u1.Function, sizeof(uintptr_t),
+                                   PAGE_READWRITE, &oldProtect);
+                    iatThunk->u1.Function = (uintptr_t)hookFunc;
+                    VirtualProtect(&iatThunk->u1.Function, sizeof(uintptr_t),
+                                   oldProtect, &oldProtect);
+                    return true;
+                }
+
+                iatThunk++;
+                if (origThunk) origThunk++;
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+
+// ─── EAT (Export Address Table) hook ────────────────────────────────────────
+
+static bool PatchEAT(HMODULE hModule, const char* funcName, void* hookFunc, void** origFunc)
+{
+    __try {
+        BYTE* base = (BYTE*)hModule;
+        auto dos = (IMAGE_DOS_HEADER*)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+        auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+        auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (!dir.VirtualAddress) return false;
+
+        auto exports = (IMAGE_EXPORT_DIRECTORY*)(base + dir.VirtualAddress);
+        DWORD* names = (DWORD*)(base + exports->AddressOfNames);
+        WORD* ordinals = (WORD*)(base + exports->AddressOfNameOrdinals);
+        DWORD* functions = (DWORD*)(base + exports->AddressOfFunctions);
+
+        for (DWORD i = 0; i < exports->NumberOfNames; i++) {
+            if (strcmp((const char*)(base + names[i]), funcName) == 0) {
+                DWORD funcRVA = functions[ordinals[i]];
+                *origFunc = (void*)(base + funcRVA);
+
+                DWORD newRVA = (DWORD)((BYTE*)hookFunc - base);
+                DWORD oldProtect;
+                VirtualProtect(&functions[ordinals[i]], sizeof(DWORD),
+                               PAGE_READWRITE, &oldProtect);
+                functions[ordinals[i]] = newRVA;
+                VirtualProtect(&functions[ordinals[i]], sizeof(DWORD),
+                               oldProtect, &oldProtect);
+                return true;
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
 }
 
 static void InstallVibrationHook()
@@ -158,23 +201,39 @@ static void InstallVibrationHook()
     }
     Log("Found XInput: %s", loadedXInput);
 
-    // Get the actual function address
-    FARPROC pSetState = GetProcAddress(hXInput, "XInputSetState");
-    if (!pSetState) {
-        Log("WARNING: XInputSetState not found in %s", loadedXInput);
-        return;
-    }
-    Log("XInputSetState at 0x%llX", (unsigned long long)pSetState);
-
-    // Also grab XInputGetState for reading button state
     g_OrigGetState = (fn_XInputGetState)GetProcAddress(hXInput, "XInputGetState");
+    g_OrigSetState = (fn_XInputSetState)GetProcAddress(hXInput, "XInputSetState");
+    Log("XInputSetState at 0x%llX", (unsigned long long)g_OrigSetState);
 
-    // Install inline hook
-    if (InlineHook((void*)pSetState, (void*)HookedXInputSetState)) {
+    // Method 1: Try IAT hook on all modules
+    HMODULE mods[1024];
+    DWORD needed = 0;
+    int iatPatched = 0;
+    if (EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) {
+        int count = (int)(needed / sizeof(HMODULE));
+        for (int i = 0; i < count; i++) {
+            if (mods[i] == g_Module || mods[i] == hXInput) continue;
+            void* orig = nullptr;
+            if (PatchIATFunc(mods[i], loadedXInput, "XInputSetState",
+                             (void*)HookedXInputSetState, &orig)) {
+                iatPatched++;
+            }
+        }
+    }
+    if (iatPatched > 0) {
         g_Hooked = true;
-        Log("Inline hook installed on XInputSetState");
-    } else {
-        Log("WARNING: Failed to install inline hook");
+        Log("IAT hook installed (%d modules)", iatPatched);
+    }
+
+    // Method 2: Also try EAT hook so GetProcAddress returns our hook
+    void* eatOrig = nullptr;
+    if (PatchEAT(hXInput, "XInputSetState", (void*)HookedXInputSetState, &eatOrig)) {
+        g_Hooked = true;
+        Log("EAT hook installed on %s", loadedXInput);
+    }
+
+    if (!g_Hooked) {
+        Log("WARNING: No hook method worked");
     }
 }
 
@@ -193,7 +252,6 @@ static void AutoGreenThread()
 
     while (g_AutoGreen && g_Running) {
         if (g_VibrationDetected.exchange(false)) {
-            // Vibration detected! Check if shoot button (X) is held
             XINPUT_STATE state;
             bool xHeld = false;
             if (g_OrigGetState && g_OrigGetState(0, &state) == ERROR_SUCCESS) {
@@ -205,7 +263,6 @@ static void AutoGreenThread()
                 Log(">>> VIBRATION RELEASE #%d (motors L=%u R=%u) <<<",
                     g_ShotsTaken.load(), g_LastLeftMotor.load(), g_LastRightMotor.load());
 
-                // Release by briefly disabling XInput
                 HMODULE hXInput = nullptr;
                 const char* xinputDlls[] = {"xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll"};
                 for (auto dll : xinputDlls) {
