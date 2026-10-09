@@ -85,11 +85,11 @@ static bool g_Hooked = false;
 // Shared state
 static std::atomic<bool> g_BlockX{false};
 static std::atomic<DWORD> g_BlockXUntil{0};
+static std::atomic<bool> g_ShotActive{false};
 
 // Timer mode state
 static std::atomic<bool> g_TimerMode{true};
 static std::atomic<int> g_ReleaseDelayMs{450};
-static std::atomic<bool> g_XWasHeld{false};
 static LARGE_INTEGER g_XPressTime = {};
 static LARGE_INTEGER g_PerfFreq = {};
 
