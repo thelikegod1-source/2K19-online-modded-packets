@@ -142,8 +142,8 @@ static DWORD WINAPI MyXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState)
         g_VibrationSeen = false;
     }
 
-    // Timer fires after delay
-    if (g_ShotActive && xHeld && !g_BlockX) {
+    // Timer fires after delay (only once per shot)
+    if (g_ShotActive && xHeld && !g_BlockX && !g_TimerFired) {
         LARGE_INTEGER now;
         QueryPerformanceCounter(&now);
         double elapsedMs = (double)(now.QuadPart - g_XPressTime.QuadPart)
