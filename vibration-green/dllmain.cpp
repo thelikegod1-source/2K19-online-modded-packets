@@ -80,6 +80,8 @@ static fn_XInputGetState g_RealGetState = nullptr;
 static std::atomic<bool> g_VibrationDetected{false};
 static std::atomic<WORD> g_LastLeftMotor{0};
 static std::atomic<WORD> g_LastRightMotor{0};
+static std::atomic<bool> g_BlockX{false};
+static std::atomic<DWORD> g_BlockXUntil{0};
 static bool g_Hooked = false;
 
 static DWORD WINAPI MyXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
@@ -93,6 +95,20 @@ static DWORD WINAPI MyXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibra
         }
     }
     return g_RealSetState(dwUserIndex, pVibration);
+}
+
+static DWORD WINAPI MyXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState)
+{
+    DWORD result = g_RealGetState(dwUserIndex, pState);
+    if (result == ERROR_SUCCESS && g_BlockX) {
+        DWORD now = GetTickCount();
+        if (now < g_BlockXUntil) {
+            pState->Gamepad.wButtons &= ~XINPUT_GAMEPAD_X;
+        } else {
+            g_BlockX = false;
+        }
+    }
+    return result;
 }
 
 static bool InstallHook()
@@ -123,6 +139,8 @@ static bool InstallHook()
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     DetourAttach((PVOID*)&g_RealSetState, (PVOID)MyXInputSetState);
+    if (g_RealGetState)
+        DetourAttach((PVOID*)&g_RealGetState, (PVOID)MyXInputGetState);
     LONG err = DetourTransactionCommit();
 
     if (err != NO_ERROR) {
@@ -140,6 +158,8 @@ static void RemoveHook()
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     DetourDetach((PVOID*)&g_RealSetState, (PVOID)MyXInputSetState);
+    if (g_RealGetState)
+        DetourDetach((PVOID*)&g_RealGetState, (PVOID)MyXInputGetState);
     DetourTransactionCommit();
     g_Hooked = false;
     Log("Detours hook removed");
@@ -173,22 +193,9 @@ static void AutoGreenThread()
                 Log(">>> VIBRATION RELEASE #%d (motors L=%u R=%u) <<<",
                     g_ShotsTaken.load(), g_LastLeftMotor.load(), g_LastRightMotor.load());
 
-                HMODULE hXInput = nullptr;
-                const char* xinputDlls[] = {"xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll"};
-                for (auto dll : xinputDlls) {
-                    hXInput = GetModuleHandleA(dll);
-                    if (hXInput) break;
-                }
-
-                typedef void (WINAPI *fn_XInputEnable)(BOOL);
-                fn_XInputEnable pEnable = nullptr;
-                if (hXInput) pEnable = (fn_XInputEnable)GetProcAddress(hXInput, "XInputEnable");
-
-                if (pEnable) {
-                    pEnable(FALSE);
-                    pEnable(TRUE);
-                    Log("Released via XInputEnable");
-                }
+                g_BlockXUntil = GetTickCount() + 100;
+                g_BlockX = true;
+                Log("Blocking X button for 100ms");
 
                 Sleep(200);
             }
