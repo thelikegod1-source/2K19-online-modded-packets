@@ -1,15 +1,16 @@
 /**
- * autogreen.dll v7 — Timer + Vibration auto-green for NBA 2K19
+ * autogreen.dll v8 — Hybrid Timer + Vibration Auto-Calibration
  *
- * Two modes:
- *   TIMER MODE (default): Detects when X is pressed, waits a precise
- *     delay, then releases. Use F5/F6 to adjust timing +/- 5ms.
- *   VIBRATION MODE: Falls back to vibration detection (kept from v6).
+ * Uses timer as the base release mechanism (default 670ms).
+ * Monitors vibration feedback to auto-adjust the delay:
+ *   - If vibration arrives BEFORE timer fires → delay too long, decrease
+ *   - If vibration arrives AFTER timer fires → delay too short, increase
+ *   - Converges to optimal timing for current lag conditions
  *
  * Hotkeys:
- *   F5  = decrease timer by 5ms (release earlier)
- *   F6  = increase timer by 5ms (release later)
- *   F7  = toggle between TIMER and VIBRATION mode
+ *   F5  = decrease timer by 5ms (manual adjust)
+ *   F6  = increase timer by 5ms (manual adjust)
+ *   F7  = toggle auto-calibration on/off
  *   F8  = toggle auto-green on/off
  *   F9  = dump state to log
  *   F10 = toggle lag switch
@@ -73,7 +74,7 @@ static std::atomic<int> g_ShotsTaken{0};
 static std::atomic<bool> g_LagActive{false};
 static HANDLE g_Thread = nullptr;
 
-// ─── Timer + Vibration system ──────────────────────────────────────────────
+// ─── Hybrid Timer + Vibration system ────────────────────────────────────────
 
 typedef DWORD (WINAPI *fn_XInputSetState)(DWORD, XINPUT_VIBRATION*);
 typedef DWORD (WINAPI *fn_XInputGetState)(DWORD, XINPUT_STATE*);
@@ -87,28 +88,40 @@ static std::atomic<bool> g_BlockX{false};
 static std::atomic<DWORD> g_BlockXUntil{0};
 static std::atomic<bool> g_ShotActive{false};
 
-// Timer mode state
-static std::atomic<bool> g_TimerMode{true};
-static std::atomic<int> g_ReleaseDelayMs{450};
+// Timer state
+static std::atomic<int> g_ReleaseDelayMs{670};
 static LARGE_INTEGER g_XPressTime = {};
 static LARGE_INTEGER g_PerfFreq = {};
+static std::atomic<bool> g_TimerFired{false};
+static LARGE_INTEGER g_TimerFireTime = {};
 
-// Vibration mode state
+// Auto-calibration state
+static std::atomic<bool> g_AutoCalibrate{true};
+static std::atomic<bool> g_VibrationSeen{false};
+static LARGE_INTEGER g_VibrationTime = {};
+static std::atomic<int> g_CalibrationCount{0};
+static std::atomic<int> g_TotalAdjustment{0};
+
+// Vibration monitoring
 static std::atomic<WORD> g_LastLeftMotor{0};
 static std::atomic<WORD> g_LastRightMotor{0};
 
 static DWORD WINAPI MyXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
 {
     if (pVibration) {
+        WORD prevLeft = g_LastLeftMotor.load();
+        WORD prevRight = g_LastRightMotor.load();
         g_LastLeftMotor = pVibration->wLeftMotorSpeed;
         g_LastRightMotor = pVibration->wRightMotorSpeed;
-        if (g_AutoGreen && !g_TimerMode
-            && (pVibration->wLeftMotorSpeed > 0 || pVibration->wRightMotorSpeed > 0)
-            && !g_BlockX && !g_ShotActive) {
-            g_ShotsTaken++;
-            g_ShotActive = true;
-            g_BlockXUntil = GetTickCount() + 150;
-            g_BlockX = true;
+
+        // Detect vibration onset (transition from zero to non-zero) during an active shot
+        if (g_AutoGreen && g_ShotActive
+            && (prevLeft == 0 && prevRight == 0)
+            && (pVibration->wLeftMotorSpeed > 0 || pVibration->wRightMotorSpeed > 0)) {
+            if (!g_VibrationSeen) {
+                QueryPerformanceCounter(&g_VibrationTime);
+                g_VibrationSeen = true;
+            }
         }
     }
     return g_RealSetState(dwUserIndex, pVibration);
@@ -121,36 +134,75 @@ static DWORD WINAPI MyXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState)
 
     bool xHeld = (pState->Gamepad.wButtons & XINPUT_GAMEPAD_X) != 0;
 
-    // Timer mode: detect X press start, release after delay
-    if (g_TimerMode) {
-        if (xHeld && !g_ShotActive && !g_BlockX) {
-            QueryPerformanceCounter(&g_XPressTime);
-            g_ShotActive = true;
-        }
+    // Detect X press start
+    if (xHeld && !g_ShotActive && !g_BlockX) {
+        QueryPerformanceCounter(&g_XPressTime);
+        g_ShotActive = true;
+        g_TimerFired = false;
+        g_VibrationSeen = false;
+    }
 
-        if (g_ShotActive && xHeld && !g_BlockX) {
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            double elapsedMs = (double)(now.QuadPart - g_XPressTime.QuadPart)
+    // Timer fires after delay
+    if (g_ShotActive && xHeld && !g_BlockX) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        double elapsedMs = (double)(now.QuadPart - g_XPressTime.QuadPart)
+                         / (double)g_PerfFreq.QuadPart * 1000.0;
+        if (elapsedMs >= (double)g_ReleaseDelayMs.load()) {
+            g_ShotsTaken++;
+            g_BlockXUntil = GetTickCount() + 200;
+            g_BlockX = true;
+            g_TimerFired = true;
+            QueryPerformanceCounter(&g_TimerFireTime);
+
+            // Auto-calibration: compare vibration timing to timer
+            if (g_AutoCalibrate && g_VibrationSeen) {
+                double vibMs = (double)(g_VibrationTime.QuadPart - g_XPressTime.QuadPart)
                              / (double)g_PerfFreq.QuadPart * 1000.0;
-            if (elapsedMs >= (double)g_ReleaseDelayMs.load()) {
-                g_ShotsTaken++;
-                g_BlockXUntil = GetTickCount() + 200;
-                g_BlockX = true;
-            }
-        }
+                double diff = vibMs - elapsedMs;
+                // diff < 0 means vibration came BEFORE timer → we're late → decrease delay
+                // diff > 0 means vibration came AFTER timer → we're early → increase delay
+                int adjust = 0;
+                if (diff < -10.0) adjust = -3;
+                else if (diff < -3.0) adjust = -1;
+                else if (diff > 10.0) adjust = 3;
+                else if (diff > 3.0) adjust = 1;
 
-        if (!xHeld && !g_BlockX) {
-            g_ShotActive = false;
+                if (adjust != 0) {
+                    int newDelay = g_ReleaseDelayMs.load() + adjust;
+                    if (newDelay < 100) newDelay = 100;
+                    if (newDelay > 1500) newDelay = 1500;
+                    g_ReleaseDelayMs = newDelay;
+                    g_CalibrationCount++;
+                    g_TotalAdjustment += adjust;
+                    Log("AUTO-CAL: vib=%.1fms timer=%.1fms diff=%.1fms adj=%+dms → delay=%dms",
+                        vibMs, elapsedMs, diff, adjust, newDelay);
+                }
+            }
         }
     }
 
-    // Vibration mode: reset shot active when X released
-    if (!g_TimerMode && !xHeld) {
+    // Reset shot when X released and not blocking
+    if (!xHeld && !g_BlockX) {
+        // Late vibration check: if timer hasn't fired yet but vibration arrived, we missed it
+        if (g_ShotActive && !g_TimerFired && g_VibrationSeen && g_AutoCalibrate) {
+            double vibMs = (double)(g_VibrationTime.QuadPart - g_XPressTime.QuadPart)
+                         / (double)g_PerfFreq.QuadPart * 1000.0;
+            int currentDelay = g_ReleaseDelayMs.load();
+            // Vibration came but timer never fired — delay is way too long
+            int adjust = -5;
+            int newDelay = currentDelay + adjust;
+            if (newDelay < 100) newDelay = 100;
+            g_ReleaseDelayMs = newDelay;
+            g_CalibrationCount++;
+            g_TotalAdjustment += adjust;
+            Log("AUTO-CAL (missed): vib=%.1fms delay=%dms → reduced to %dms",
+                vibMs, currentDelay, newDelay);
+        }
         g_ShotActive = false;
     }
 
-    // Block X when flag is set (both modes)
+    // Block X when flag is set
     if (g_BlockX) {
         DWORD now = GetTickCount();
         if (now < g_BlockXUntil) {
@@ -222,9 +274,9 @@ static void RemoveHook()
 
 static void AutoGreenThread()
 {
-    Log("=== AUTO-GREEN v7 ACTIVE ===");
-    Log("Mode: %s", g_TimerMode.load() ? "TIMER" : "VIBRATION");
+    Log("=== AUTO-GREEN v8 ACTIVE (HYBRID AUTO-CAL) ===");
     Log("Timer delay: %d ms", g_ReleaseDelayMs.load());
+    Log("Auto-calibration: %s", g_AutoCalibrate.load() ? "ON" : "OFF");
 
     if (!g_Hooked) {
         g_Hooked = InstallHook();
@@ -239,13 +291,10 @@ static void AutoGreenThread()
     while (g_AutoGreen && g_Running) {
         int shots = g_ShotsTaken.load();
         if (shots != lastShots) {
-            if (g_TimerMode) {
-                Log(">>> TIMER RELEASE #%d (delay=%dms) <<<",
-                    shots, g_ReleaseDelayMs.load());
-            } else {
-                Log(">>> VIBRATION RELEASE #%d (motors L=%u R=%u) <<<",
-                    shots, g_LastLeftMotor.load(), g_LastRightMotor.load());
-            }
+            Log(">>> RELEASE #%d (delay=%dms, cal=%s, adjustments=%d, total=%+dms) <<<",
+                shots, g_ReleaseDelayMs.load(),
+                g_AutoCalibrate.load() ? "ON" : "OFF",
+                g_CalibrationCount.load(), g_TotalAdjustment.load());
             lastShots = shots;
         }
         Sleep(10);
@@ -297,7 +346,7 @@ static void ToggleLag()
 
 static void HotkeyThread()
 {
-    Log("Hotkeys: F5/F6=adjust timer, F7=mode, F8=toggle, F9=dump, F10=lag, F12=uninject");
+    Log("Hotkeys: F5/F6=adjust timer, F7=toggle auto-cal, F8=toggle, F9=dump, F10=lag, F12=uninject");
 
     while (g_Running) {
         if (GetAsyncKeyState(VK_F5) & 1) {
@@ -313,9 +362,9 @@ static void HotkeyThread()
             Log("F6: Timer delay = %d ms (later)", g_ReleaseDelayMs.load());
         }
         if (GetAsyncKeyState(VK_F7) & 1) {
-            bool was = g_TimerMode.load();
-            g_TimerMode = !was;
-            Log("F7: Switched to %s mode", g_TimerMode.load() ? "TIMER" : "VIBRATION");
+            bool was = g_AutoCalibrate.load();
+            g_AutoCalibrate = !was;
+            Log("F7: Auto-calibration %s", g_AutoCalibrate.load() ? "ON" : "OFF");
         }
         if (GetAsyncKeyState(VK_F8) & 1) {
             if (g_AutoGreen) {
@@ -332,9 +381,10 @@ static void HotkeyThread()
         if (GetAsyncKeyState(VK_F9) & 1) {
             Log("=== F9: STATE DUMP ===");
             Log("  Auto-green: %s", g_AutoGreen.load() ? "ON" : "OFF");
-            Log("  Mode: %s", g_TimerMode.load() ? "TIMER" : "VIBRATION");
+            Log("  Auto-calibration: %s", g_AutoCalibrate.load() ? "ON" : "OFF");
             Log("  Timer delay: %d ms", g_ReleaseDelayMs.load());
             Log("  Shots: %d", g_ShotsTaken.load());
+            Log("  Calibrations: %d (total adj: %+dms)", g_CalibrationCount.load(), g_TotalAdjustment.load());
             Log("  Hook: %s", g_Hooked ? "YES" : "NO");
             Log("  Last motors: L=%u R=%u", g_LastLeftMotor.load(), g_LastRightMotor.load());
             Log("  Lag switch: %s", g_LagActive.load() ? "ON" : "OFF");
@@ -369,11 +419,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(hModule);
         g_Module = hModule;
         LogInit();
-        Log("autogreen.dll v7 loaded (TIMER+VIBRATION) - pid %u", GetCurrentProcessId());
+        Log("autogreen.dll v8 loaded (HYBRID AUTO-CAL) - pid %u", GetCurrentProcessId());
         g_Thread = CreateThread(NULL, 0,
             [](LPVOID) -> DWORD { HotkeyThread(); return 0; },
             NULL, 0, NULL);
-        Log("Ready! Press F8 to enable. F5/F6 to adjust timer. F7 to switch mode.");
+        Log("Ready! Press F8 to enable. F5/F6 to adjust timer. F7 to toggle auto-cal.");
         break;
 
     case DLL_PROCESS_DETACH:
