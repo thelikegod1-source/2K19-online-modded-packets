@@ -90,8 +90,10 @@ static DWORD WINAPI MyXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibra
         g_LastLeftMotor = pVibration->wLeftMotorSpeed;
         g_LastRightMotor = pVibration->wRightMotorSpeed;
         if ((pVibration->wLeftMotorSpeed > 0 || pVibration->wRightMotorSpeed > 0)
-            && g_AutoGreen) {
-            g_VibrationDetected = true;
+            && g_AutoGreen && !g_BlockX) {
+            g_ShotsTaken++;
+            g_BlockXUntil = GetTickCount() + 100;
+            g_BlockX = true;
         }
     }
     return g_RealSetState(dwUserIndex, pVibration);
@@ -180,27 +182,15 @@ static void AutoGreenThread()
         return;
     }
 
+    int lastShots = 0;
     while (g_AutoGreen && g_Running) {
-        if (g_VibrationDetected.exchange(false)) {
-            XINPUT_STATE state;
-            bool xHeld = false;
-            if (g_RealGetState && g_RealGetState(0, &state) == ERROR_SUCCESS) {
-                xHeld = (state.Gamepad.wButtons & XINPUT_GAMEPAD_X) != 0;
-            }
-
-            if (xHeld) {
-                g_ShotsTaken++;
-                Log(">>> VIBRATION RELEASE #%d (motors L=%u R=%u) <<<",
-                    g_ShotsTaken.load(), g_LastLeftMotor.load(), g_LastRightMotor.load());
-
-                g_BlockXUntil = GetTickCount() + 100;
-                g_BlockX = true;
-                Log("Blocking X button for 100ms");
-
-                Sleep(200);
-            }
+        int shots = g_ShotsTaken.load();
+        if (shots != lastShots) {
+            Log(">>> VIBRATION RELEASE #%d (motors L=%u R=%u) <<<",
+                shots, g_LastLeftMotor.load(), g_LastRightMotor.load());
+            lastShots = shots;
         }
-        Sleep(1);
+        Sleep(10);
     }
     Log("Auto-green stopped");
 }
