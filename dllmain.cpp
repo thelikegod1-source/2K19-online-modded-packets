@@ -83,8 +83,10 @@ static std::atomic<WORD> g_LastLeftMotor{0};
 static std::atomic<WORD> g_LastRightMotor{0};
 static bool g_Hooked = false;
 
-static BYTE g_OrigBytes[14] = {};
-static BYTE* g_Trampoline = nullptr;
+static BYTE g_OrigBytes[12] = {};
+static BYTE g_HookBytes[12] = {};
+static BYTE* g_TargetFunc = nullptr;
+static CRITICAL_SECTION g_HookLock;
 
 static DWORD WINAPI HookedXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
 {
@@ -97,48 +99,43 @@ static DWORD WINAPI HookedXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pV
             g_VibrationDetected = true;
         }
     }
-    return g_OrigSetState(dwUserIndex, pVibration);
+
+    // Unhook, call original, rehook (safe hot-patch)
+    EnterCriticalSection(&g_HookLock);
+    DWORD oldProt;
+    VirtualProtect(g_TargetFunc, 12, PAGE_EXECUTE_READWRITE, &oldProt);
+    memcpy(g_TargetFunc, g_OrigBytes, 12);
+    FlushInstructionCache(GetCurrentProcess(), g_TargetFunc, 12);
+    DWORD result = ((fn_XInputSetState)g_TargetFunc)(dwUserIndex, pVibration);
+    memcpy(g_TargetFunc, g_HookBytes, 12);
+    FlushInstructionCache(GetCurrentProcess(), g_TargetFunc, 12);
+    VirtualProtect(g_TargetFunc, 12, oldProt, &oldProt);
+    LeaveCriticalSection(&g_HookLock);
+
+    return result;
 }
 
-// Inline hook: overwrites first bytes of target function with a jump to our hook.
-// Saves the original bytes in a trampoline so we can still call the original.
-static bool InlineHook(void* targetFunc, void* hookFunc, fn_XInputSetState* origOut)
+static bool InlineHook(void* targetFunc, void* hookFunc)
 {
-    BYTE* target = (BYTE*)targetFunc;
+    g_TargetFunc = (BYTE*)targetFunc;
+    InitializeCriticalSection(&g_HookLock);
 
-    // Allocate executable memory for trampoline
-    g_Trampoline = (BYTE*)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE,
-                                        PAGE_EXECUTE_READWRITE);
-    if (!g_Trampoline) return false;
+    // Save original bytes
+    memcpy(g_OrigBytes, g_TargetFunc, 12);
 
-    // Save original bytes (14 bytes for a 64-bit absolute jump)
-    memcpy(g_OrigBytes, target, 14);
+    // Build hook jump: MOV RAX, hookFunc; JMP RAX
+    g_HookBytes[0] = 0x48;
+    g_HookBytes[1] = 0xB8;
+    *(UINT64*)(g_HookBytes + 2) = (UINT64)hookFunc;
+    g_HookBytes[10] = 0xFF;
+    g_HookBytes[11] = 0xE0;
 
-    // Build trampoline: original bytes + jump back to target+14
-    memcpy(g_Trampoline, g_OrigBytes, 14);
-    // JMP [rip+0] followed by 8-byte address
-    g_Trampoline[14] = 0xFF;
-    g_Trampoline[15] = 0x25;
-    *(DWORD*)(g_Trampoline + 16) = 0; // rip+0
-    *(UINT64*)(g_Trampoline + 20) = (UINT64)(target + 14);
-
-    *origOut = (fn_XInputSetState)g_Trampoline;
-
-    // Overwrite target with jump to our hook
+    // Install
     DWORD oldProtect;
-    VirtualProtect(target, 14, PAGE_EXECUTE_READWRITE, &oldProtect);
-
-    // MOV RAX, hookFunc; JMP RAX  (total 12 bytes, pad with NOP NOP)
-    target[0] = 0x48; // REX.W
-    target[1] = 0xB8; // MOV RAX, imm64
-    *(UINT64*)(target + 2) = (UINT64)hookFunc;
-    target[10] = 0xFF;
-    target[11] = 0xE0; // JMP RAX
-    target[12] = 0x90; // NOP
-    target[13] = 0x90; // NOP
-
-    VirtualProtect(target, 14, oldProtect, &oldProtect);
-    FlushInstructionCache(GetCurrentProcess(), target, 14);
+    VirtualProtect(g_TargetFunc, 12, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy(g_TargetFunc, g_HookBytes, 12);
+    VirtualProtect(g_TargetFunc, 12, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), g_TargetFunc, 12);
 
     return true;
 }
@@ -173,7 +170,7 @@ static void InstallVibrationHook()
     g_OrigGetState = (fn_XInputGetState)GetProcAddress(hXInput, "XInputGetState");
 
     // Install inline hook
-    if (InlineHook((void*)pSetState, (void*)HookedXInputSetState, &g_OrigSetState)) {
+    if (InlineHook((void*)pSetState, (void*)HookedXInputSetState)) {
         g_Hooked = true;
         Log("Inline hook installed on XInputSetState");
     } else {
