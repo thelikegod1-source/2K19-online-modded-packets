@@ -88,11 +88,11 @@ static bool SafeReadFloat(uintptr_t addr, float* out)
     }
 }
 
-// ─── Memory regions — scan everything readable ──────────────────────────────
+// ─── Memory regions ────────────────────────────────────────────────────────
 
 struct MemRegion { uintptr_t base; size_t size; };
 
-static std::vector<MemRegion> GetScanRegions()
+static std::vector<MemRegion> GetScanRegions(bool imageOnly)
 {
     std::vector<MemRegion> regions;
     SYSTEM_INFO si;
@@ -108,7 +108,11 @@ static std::vector<MemRegion> GetScanRegions()
             !(mbi.Protect & PAGE_GUARD) &&
             !(mbi.Protect & PAGE_NOACCESS) &&
             mbi.RegionSize <= 256 * 1024 * 1024) {
-            regions.push_back({(uintptr_t)mbi.BaseAddress, mbi.RegionSize});
+            bool isImage = (mbi.Type == MEM_IMAGE);
+            bool isRW = (mbi.Protect == PAGE_READWRITE || mbi.Protect == PAGE_WRITECOPY);
+            if (!imageOnly || (isImage && isRW)) {
+                regions.push_back({(uintptr_t)mbi.BaseAddress, mbi.RegionSize});
+            }
         }
         addr = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
     }
@@ -137,34 +141,33 @@ static int ScanRegionForRange(uintptr_t base, size_t size,
     return count;
 }
 
-// ─── Simple meter finder ────────────────────────────────────────────────────
+// ─── Scan regions and collect rising floats ────────────────────────────────
 
-static uintptr_t FindMeterSimple()
+struct ScanAddr { uintptr_t a; float v; };
+struct ScanFinal { uintptr_t a; float v1, v2, v3; float rate; };
+
+static uintptr_t ScanAndFilter(std::vector<MemRegion>& regions, const char* label)
 {
-    Log("=== METER SCAN (F5) ===");
     auto t0 = std::chrono::steady_clock::now();
-
-    auto regions = GetScanRegions();
     size_t totalBytes = 0;
     for (auto& r : regions) totalBytes += r.size;
-    Log("Scanning %zu regions (%.0f MB)...", regions.size(), totalBytes / (1024.0 * 1024.0));
+    Log("[%s] Scanning %zu regions (%.0f MB)...", label, regions.size(), totalBytes / (1024.0 * 1024.0));
 
-    struct Addr { uintptr_t a; float v; };
-    std::vector<Addr> pass1;
-    pass1.reserve(2000000);
+    std::vector<ScanAddr> pass1;
+    pass1.reserve(500000);
 
     const int BATCH = 65536;
     uintptr_t batchAddrs[65536];
     float batchVals[65536];
 
     for (auto& region : regions) {
-        if (pass1.size() >= 10000000) break;
+        if (pass1.size() >= 5000000) break;
         size_t off = 0;
-        while (off < region.size && pass1.size() < 10000000) {
+        while (off < region.size && pass1.size() < 5000000) {
             size_t chunk = region.size - off;
             if (chunk > (size_t)BATCH * 4) chunk = (size_t)BATCH * 4;
             int found = ScanRegionForRange(region.base + off, chunk,
-                                           0.05f, 0.90f, batchAddrs, batchVals, BATCH);
+                                           0.02f, 0.95f, batchAddrs, batchVals, BATCH);
             for (int j = 0; j < found; j++)
                 pass1.push_back({batchAddrs[j], batchVals[j]});
             off += chunk;
@@ -172,95 +175,76 @@ static uintptr_t FindMeterSimple()
     }
 
     auto t1 = std::chrono::steady_clock::now();
-    Log("Pass 1: %zu floats in [0.05, 0.90] (%.0f ms)",
+    Log("[%s] Pass 1: %zu floats (%.0f ms)", label,
         pass1.size(), std::chrono::duration<double, std::milli>(t1 - t0).count());
 
-    if (pass1.empty()) {
-        Log("Nothing found. Are you mid-shot?");
-        return 0;
-    }
+    if (pass1.empty()) return 0;
 
-    // Pass 2: wait 50ms, keep only addresses where value went UP
-    Sleep(50);
-    std::vector<Addr> pass2;
-    pass2.reserve(pass1.size() / 10);
-
+    Sleep(40);
+    std::vector<ScanAddr> pass2;
+    pass2.reserve(pass1.size() / 20);
     for (auto& p : pass1) {
         float v2;
         if (!SafeReadFloat(p.a, &v2)) continue;
-        if (v2 > p.v + 0.001f && v2 >= 0.05f && v2 <= 0.98f) {
+        if (v2 > p.v + 0.002f && v2 <= 1.0f)
             pass2.push_back({p.a, v2});
-        }
     }
+    Log("[%s] Pass 2: %zu rising after 40ms", label, pass2.size());
+    if (pass2.empty()) return 0;
 
-    Log("Pass 2: %zu still rising after 50ms", pass2.size());
-    if (pass2.empty()) {
-        Log("No rising floats. Press F5 earlier in the shot.");
-        return 0;
-    }
-
-    // Pass 3: wait another 50ms, keep ones still rising
-    Sleep(50);
-    struct Candidate { uintptr_t a; float v1, v2, v3; };
-    std::vector<Candidate> pass3;
-
+    Sleep(40);
+    std::vector<ScanFinal> finals;
     for (auto& p : pass2) {
         float v3;
         if (!SafeReadFloat(p.a, &v3)) continue;
-        if (v3 > p.v + 0.001f && v3 >= 0.05f && v3 <= 0.99f) {
-            pass3.push_back({p.a, 0, p.v, v3});
+        if (v3 > p.v + 0.002f && v3 <= 1.05f) {
+            float rate = (v3 - p.v) / 0.040f;
+            if (rate >= 0.1f && rate <= 5.0f)
+                finals.push_back({p.a, 0, p.v, v3, rate});
         }
     }
+    Log("[%s] Pass 3: %zu confirmed rising", label, finals.size());
+    if (finals.empty()) return 0;
 
-    Log("Pass 3: %zu still rising after another 50ms", pass3.size());
-    if (pass3.empty()) {
-        Log("Lost all candidates. Shot may have ended. Try again!");
-        return 0;
-    }
-
-    // Pass 4: one more check 50ms later for confidence
-    Sleep(50);
-    struct Final { uintptr_t a; float v2, v3, v4; float rate; };
-    std::vector<Final> finals;
-
-    for (auto& c : pass3) {
-        float v4;
-        if (!SafeReadFloat(c.a, &v4)) continue;
-        if (v4 > c.v3 + 0.001f && v4 <= 1.05f) {
-            float rate = (v4 - c.v2) / 0.100f;  // rise per 100ms
-            finals.push_back({c.a, c.v2, c.v3, v4, rate});
-        }
-    }
-
-    Log("Pass 4: %zu candidates confirmed rising over 150ms", finals.size());
-
-    if (finals.empty()) {
-        Log("No steady risers found. Press F5 when meter is ~1/3 full.");
-        return 0;
-    }
-
-    // Pick the best: prefer rate closest to what a shot meter looks like (~0.5-1.5/sec)
-    // Shot meter goes 0→1 in about 1-2 seconds, so rate ~0.05-0.15 per 100ms
-    std::sort(finals.begin(), finals.end(), [](const Final& a, const Final& b) {
-        float aFit = fabsf(a.rate - 0.10f);
-        float bFit = fabsf(b.rate - 0.10f);
+    std::sort(finals.begin(), finals.end(), [](const ScanFinal& a, const ScanFinal& b) {
+        float aFit = fabsf(a.rate - 0.70f);
+        float bFit = fabsf(b.rate - 0.70f);
         return aFit < bFit;
     });
 
     int show = finals.size() < 10 ? (int)finals.size() : 10;
-    Log("Top candidates:");
+    Log("[%s] Top candidates:", label);
     for (int i = 0; i < show; i++) {
-        Log("  [%d] addr=0x%llX  vals: %.3f -> %.3f -> %.3f  rate=%.3f/100ms",
+        Log("  [%d] addr=0x%llX  %.3f -> %.3f  rate=%.2f/sec",
             i, (unsigned long long)finals[i].a,
-            finals[i].v2, finals[i].v3, finals[i].v4, finals[i].rate);
+            finals[i].v2, finals[i].v3, finals[i].rate);
     }
 
-    auto& best = finals[0];
     auto tEnd = std::chrono::steady_clock::now();
-    Log("*** METER FOUND: addr=0x%llX (rate=%.3f/100ms, total %.0f ms) ***",
-        (unsigned long long)best.a, best.rate,
+    Log("*** METER FOUND: addr=0x%llX (rate=%.2f/sec, %.0f ms) ***",
+        (unsigned long long)finals[0].a, finals[0].rate,
         std::chrono::duration<double, std::milli>(tEnd - t0).count());
-    return best.a;
+    return finals[0].a;
+}
+
+// ─── Meter finder — fast game-memory scan, then fallback to all memory ─────
+
+static uintptr_t FindMeterSimple()
+{
+    Log("=== METER SCAN (F5) ===");
+
+    auto imageRegions = GetScanRegions(true);
+    if (!imageRegions.empty()) {
+        uintptr_t result = ScanAndFilter(imageRegions, "IMAGE");
+        if (result) return result;
+        Log("No meter in game image memory, trying ALL memory...");
+    }
+
+    auto allRegions = GetScanRegions(false);
+    uintptr_t result = ScanAndFilter(allRegions, "ALL");
+    if (!result)
+        Log("No meter found. Press F5 earlier while meter is filling (~1/3).");
+    return result;
 }
 
 // ─── XInput hook ────────────────────────────────────────────────────────────

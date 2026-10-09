@@ -1,9 +1,5 @@
-#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
 #define NOMINMAX
-#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
@@ -16,7 +12,6 @@
 #include <sstream>
 #include <vector>
 #include <cstdio>
-#include <cmath>
 #include <psapi.h>
 #include <tlhelp32.h>
 #include "WebView2.h"
@@ -78,49 +73,27 @@ static DWORD FindProcess(const char* name) {
 static std::string DoInject() {
     std::string dllPath = WtoA(g_baseDir) + "\\autogreen.dll";
     if (GetFileAttributesA(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES)
-        return "{\"ok\":false,\"msg\":\"DLL not found at: " + dllPath + "\"}";
+        return "{\"ok\":false,\"msg\":\"DLL not found\"}";
 
     DWORD pid = FindProcess("NBA2K19.exe");
-    if (!pid) return "{\"ok\":false,\"msg\":\"NBA2K19.exe not running — launch the game first\"}";
+    if (!pid) return "{\"ok\":false,\"msg\":\"NBA2K19.exe not running\"}";
 
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
-    if (!hProc) {
-        DWORD err = GetLastError();
-        char buf[128];
-        snprintf(buf, 128, "{\"ok\":false,\"msg\":\"Cannot open process (err %lu) — run as Administrator\"}", err);
-        return buf;
-    }
+    if (!hProc) return "{\"ok\":false,\"msg\":\"Cannot open process\"}";
 
     void* mem = VirtualAllocEx(hProc, NULL, dllPath.size() + 1, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!mem) { CloseHandle(hProc); return "{\"ok\":false,\"msg\":\"VirtualAllocEx failed\"}"; }
-    if (!WriteProcessMemory(hProc, mem, dllPath.c_str(), dllPath.size() + 1, NULL)) {
-        VirtualFreeEx(hProc, mem, 0, MEM_RELEASE);
-        CloseHandle(hProc);
-        return "{\"ok\":false,\"msg\":\"WriteProcessMemory failed\"}";
-    }
+    WriteProcessMemory(hProc, mem, dllPath.c_str(), dllPath.size() + 1, NULL);
 
     HANDLE hThread = CreateRemoteThread(hProc, NULL, 0,
         (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleA("kernel32.dll"), "LoadLibraryA"),
         mem, 0, NULL);
-    if (!hThread) {
-        DWORD err = GetLastError();
-        VirtualFreeEx(hProc, mem, 0, MEM_RELEASE);
-        CloseHandle(hProc);
-        char buf[128];
-        snprintf(buf, 128, "{\"ok\":false,\"msg\":\"CreateRemoteThread failed (err %lu)\"}", err);
-        return buf;
-    }
 
-    WaitForSingleObject(hThread, 5000);
-    DWORD exitCode = 0;
-    GetExitCodeThread(hThread, &exitCode);
-    CloseHandle(hThread);
+    if (hThread) {
+        WaitForSingleObject(hThread, 5000);
+        CloseHandle(hThread);
+    }
     VirtualFreeEx(hProc, mem, 0, MEM_RELEASE);
     CloseHandle(hProc);
-
-    if (exitCode == 0)
-        return "{\"ok\":false,\"msg\":\"LoadLibraryA returned 0 — DLL failed to load\"}";
-
     g_injected = true;
     return "{\"ok\":true}";
 }
@@ -157,9 +130,6 @@ static std::string PollLog() {
 
     FILE* f = fopen(g_logPath.c_str(), "r");
     if (f) {
-        // DLL truncates the log on (re)inject; restart from the top if it shrank
-        fseek(f, 0, SEEK_END);
-        if (ftell(f) < g_logOffset) g_logOffset = 0;
         fseek(f, g_logOffset, SEEK_SET);
         char buf[4096];
         std::string newData;
@@ -740,6 +710,26 @@ static DWORD WINAPI NetThread(LPVOID) {
     return 0;
 }
 
+// ── Poll timer ──
+static void CALLBACK PollTimer(HWND, UINT, UINT_PTR, DWORD) {
+    if (!g_webView) return;
+
+    std::string logData = PollLog();
+
+    EnterCriticalSection(&g_netLock);
+    std::string net = g_netJson;
+    LeaveCriticalSection(&g_netLock);
+
+    // Merge net into the json
+    // logData ends with "}" - insert net before closing brace
+    std::string merged = logData.substr(0, logData.size() - 1) + ",\"net\":" + net + "}";
+
+    std::wstring js = L"(function(){try{const d=" + AtoW(merged) + L";window.chrome.webview.postMessage(JSON.stringify(d));}catch(e){}})()";
+
+    // Actually, we can just postMessage from C++ side — use PostWebMessageAsJson
+    g_webView->PostWebMessageAsJson(AtoW(merged).c_str());
+}
+
 // ── Entry ──
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     g_baseDir = GetBaseDir();
@@ -747,14 +737,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     // Log path
     char appdata[MAX_PATH];
     SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata);
-    CreateDirectoryA((std::string(appdata) + "\\NBA2K-AutoGreen").c_str(), NULL);
     g_logPath = std::string(appdata) + "\\NBA2K-AutoGreen\\autogreen.log";
 
     // Delete old log
     DeleteFileA(g_logPath.c_str());
-
-    // WebView2 requires COM on the UI thread
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     InitializeCriticalSection(&g_netLock);
 
@@ -819,23 +805,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
                                         if (action == "inject") {
                                             CreateThread(NULL, 0, [](LPVOID) -> DWORD {
-                                                std::string result = DoInject();
-                                                std::string js = "handleEvents(["
-                                                    + std::string(result.find("\"ok\":true") != std::string::npos
-                                                        ? "'injected'" : "'inject_fail'")
-                                                    + "]);";
-                                                if (result.find("\"ok\":true") == std::string::npos) {
-                                                    auto mp = result.find("\"msg\":\"");
-                                                    std::string errMsg = "Inject failed";
-                                                    if (mp != std::string::npos) {
-                                                        errMsg = result.substr(mp + 7);
-                                                        errMsg = errMsg.substr(0, errMsg.find('"'));
-                                                    }
-                                                    js = "alert('" + errMsg + "');";
-                                                }
-                                                if (g_webView) {
-                                                    g_webView->ExecuteScript(AtoW(js).c_str(), nullptr);
-                                                }
+                                                DoInject();
                                                 return 0;
                                             }, NULL, 0, NULL);
                                         }
