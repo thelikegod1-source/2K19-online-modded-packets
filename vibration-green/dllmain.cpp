@@ -1,13 +1,15 @@
 /**
- * autogreen.dll v6 — Vibration-based auto-green for NBA 2K19
+ * autogreen.dll v7 — Timer + Vibration auto-green for NBA 2K19
  *
- * Uses Microsoft Detours to hook XInputSetState and detect vibration.
- * 2K19 vibrates at the green release window — when vibration is
- * detected while X is held, it releases the shoot button.
- *
- * No memory scanning needed. Just inject, press F8, and shoot.
+ * Two modes:
+ *   TIMER MODE (default): Detects when X is pressed, waits a precise
+ *     delay, then releases. Use F5/F6 to adjust timing +/- 5ms.
+ *   VIBRATION MODE: Falls back to vibration detection (kept from v6).
  *
  * Hotkeys:
+ *   F5  = decrease timer by 5ms (release earlier)
+ *   F6  = increase timer by 5ms (release later)
+ *   F7  = toggle between TIMER and VIBRATION mode
  *   F8  = toggle auto-green on/off
  *   F9  = dump state to log
  *   F10 = toggle lag switch
@@ -22,6 +24,7 @@
 
 #include <xinput.h>
 #pragma comment(lib, "xinput.lib")
+#pragma comment(lib, "winmm.lib")
 
 #include <detours.h>
 #pragma comment(lib, "detours.lib")
@@ -70,27 +73,37 @@ static std::atomic<int> g_ShotsTaken{0};
 static std::atomic<bool> g_LagActive{false};
 static HANDLE g_Thread = nullptr;
 
-// ─── Vibration hook via Detours ─────────────────────────────────────────────
+// ─── Timer + Vibration system ──────────────────────────────────────────────
 
 typedef DWORD (WINAPI *fn_XInputSetState)(DWORD, XINPUT_VIBRATION*);
 typedef DWORD (WINAPI *fn_XInputGetState)(DWORD, XINPUT_STATE*);
 
 static fn_XInputSetState g_RealSetState = nullptr;
 static fn_XInputGetState g_RealGetState = nullptr;
-static std::atomic<bool> g_VibrationDetected{false};
-static std::atomic<WORD> g_LastLeftMotor{0};
-static std::atomic<WORD> g_LastRightMotor{0};
+static bool g_Hooked = false;
+
+// Shared state
 static std::atomic<bool> g_BlockX{false};
 static std::atomic<DWORD> g_BlockXUntil{0};
-static bool g_Hooked = false;
+
+// Timer mode state
+static std::atomic<bool> g_TimerMode{true};
+static std::atomic<int> g_ReleaseDelayMs{450};
+static std::atomic<bool> g_XWasHeld{false};
+static LARGE_INTEGER g_XPressTime = {};
+static LARGE_INTEGER g_PerfFreq = {};
+
+// Vibration mode state
+static std::atomic<WORD> g_LastLeftMotor{0};
+static std::atomic<WORD> g_LastRightMotor{0};
 
 static DWORD WINAPI MyXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
 {
-    if (pVibration) {
+    if (pVibration && g_AutoGreen && !g_TimerMode) {
         g_LastLeftMotor = pVibration->wLeftMotorSpeed;
         g_LastRightMotor = pVibration->wRightMotorSpeed;
         if ((pVibration->wLeftMotorSpeed > 0 || pVibration->wRightMotorSpeed > 0)
-            && g_AutoGreen && !g_BlockX) {
+            && !g_BlockX) {
             g_ShotsTaken++;
             g_BlockXUntil = GetTickCount() + 100;
             g_BlockX = true;
@@ -102,7 +115,36 @@ static DWORD WINAPI MyXInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibra
 static DWORD WINAPI MyXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState)
 {
     DWORD result = g_RealGetState(dwUserIndex, pState);
-    if (result == ERROR_SUCCESS && g_BlockX) {
+    if (result != ERROR_SUCCESS || !g_AutoGreen) return result;
+
+    bool xHeld = (pState->Gamepad.wButtons & XINPUT_GAMEPAD_X) != 0;
+
+    // Timer mode: detect X press start, release after delay
+    if (g_TimerMode) {
+        if (xHeld && !g_XWasHeld && !g_BlockX) {
+            QueryPerformanceCounter(&g_XPressTime);
+            g_XWasHeld = true;
+        }
+
+        if (g_XWasHeld && xHeld && !g_BlockX) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            double elapsedMs = (double)(now.QuadPart - g_XPressTime.QuadPart)
+                             / (double)g_PerfFreq.QuadPart * 1000.0;
+            if (elapsedMs >= (double)g_ReleaseDelayMs.load()) {
+                g_ShotsTaken++;
+                g_BlockXUntil = GetTickCount() + 150;
+                g_BlockX = true;
+            }
+        }
+
+        if (!xHeld) {
+            g_XWasHeld = false;
+        }
+    }
+
+    // Block X when flag is set (both modes)
+    if (g_BlockX) {
         DWORD now = GetTickCount();
         if (now < g_BlockXUntil) {
             pState->Gamepad.wButtons &= ~XINPUT_GAMEPAD_X;
@@ -110,11 +152,14 @@ static DWORD WINAPI MyXInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState)
             g_BlockX = false;
         }
     }
+
     return result;
 }
 
 static bool InstallHook()
 {
+    QueryPerformanceFrequency(&g_PerfFreq);
+
     const char* xinputDlls[] = {"xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll"};
     HMODULE hXInput = NULL;
     const char* loadedXInput = nullptr;
@@ -132,17 +177,17 @@ static bool InstallHook()
     g_RealSetState = (fn_XInputSetState)GetProcAddress(hXInput, "XInputSetState");
     g_RealGetState = (fn_XInputGetState)GetProcAddress(hXInput, "XInputGetState");
 
-    if (!g_RealSetState) {
-        Log("WARNING: XInputSetState not found");
+    if (!g_RealSetState || !g_RealGetState) {
+        Log("WARNING: XInput functions not found");
         return false;
     }
     Log("XInputSetState at 0x%llX", (unsigned long long)g_RealSetState);
+    Log("XInputGetState at 0x%llX", (unsigned long long)g_RealGetState);
 
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     DetourAttach((PVOID*)&g_RealSetState, (PVOID)MyXInputSetState);
-    if (g_RealGetState)
-        DetourAttach((PVOID*)&g_RealGetState, (PVOID)MyXInputGetState);
+    DetourAttach((PVOID*)&g_RealGetState, (PVOID)MyXInputGetState);
     LONG err = DetourTransactionCommit();
 
     if (err != NO_ERROR) {
@@ -150,7 +195,7 @@ static bool InstallHook()
         return false;
     }
 
-    Log("Detours hook installed on XInputSetState");
+    Log("Detours hooks installed");
     return true;
 }
 
@@ -160,24 +205,25 @@ static void RemoveHook()
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     DetourDetach((PVOID*)&g_RealSetState, (PVOID)MyXInputSetState);
-    if (g_RealGetState)
-        DetourDetach((PVOID*)&g_RealGetState, (PVOID)MyXInputGetState);
+    DetourDetach((PVOID*)&g_RealGetState, (PVOID)MyXInputGetState);
     DetourTransactionCommit();
     g_Hooked = false;
-    Log("Detours hook removed");
+    Log("Detours hooks removed");
 }
 
 // ─── Auto-green thread ─────────────────────────────────────────────────────
 
 static void AutoGreenThread()
 {
-    Log("=== AUTO-GREEN v6 (DETOURS) ACTIVE ===");
+    Log("=== AUTO-GREEN v7 ACTIVE ===");
+    Log("Mode: %s", g_TimerMode.load() ? "TIMER" : "VIBRATION");
+    Log("Timer delay: %d ms", g_ReleaseDelayMs.load());
 
     if (!g_Hooked) {
         g_Hooked = InstallHook();
     }
     if (!g_Hooked) {
-        Log("Cannot run without hook. Auto-green stopped.");
+        Log("Cannot run without hooks. Auto-green stopped.");
         g_AutoGreen = false;
         return;
     }
@@ -186,8 +232,13 @@ static void AutoGreenThread()
     while (g_AutoGreen && g_Running) {
         int shots = g_ShotsTaken.load();
         if (shots != lastShots) {
-            Log(">>> VIBRATION RELEASE #%d (motors L=%u R=%u) <<<",
-                shots, g_LastLeftMotor.load(), g_LastRightMotor.load());
+            if (g_TimerMode) {
+                Log(">>> TIMER RELEASE #%d (delay=%dms) <<<",
+                    shots, g_ReleaseDelayMs.load());
+            } else {
+                Log(">>> VIBRATION RELEASE #%d (motors L=%u R=%u) <<<",
+                    shots, g_LastLeftMotor.load(), g_LastRightMotor.load());
+            }
             lastShots = shots;
         }
         Sleep(10);
@@ -239,9 +290,26 @@ static void ToggleLag()
 
 static void HotkeyThread()
 {
-    Log("Hotkeys: F8=toggle auto-green, F9=dump, F10=lag, F12=uninject");
+    Log("Hotkeys: F5/F6=adjust timer, F7=mode, F8=toggle, F9=dump, F10=lag, F12=uninject");
 
     while (g_Running) {
+        if (GetAsyncKeyState(VK_F5) & 1) {
+            int d = g_ReleaseDelayMs.load();
+            if (d > 5) {
+                g_ReleaseDelayMs = d - 5;
+                Log("F5: Timer delay = %d ms (earlier)", g_ReleaseDelayMs.load());
+            }
+        }
+        if (GetAsyncKeyState(VK_F6) & 1) {
+            int d = g_ReleaseDelayMs.load();
+            g_ReleaseDelayMs = d + 5;
+            Log("F6: Timer delay = %d ms (later)", g_ReleaseDelayMs.load());
+        }
+        if (GetAsyncKeyState(VK_F7) & 1) {
+            bool was = g_TimerMode.load();
+            g_TimerMode = !was;
+            Log("F7: Switched to %s mode", g_TimerMode.load() ? "TIMER" : "VIBRATION");
+        }
         if (GetAsyncKeyState(VK_F8) & 1) {
             if (g_AutoGreen) {
                 g_AutoGreen = false;
@@ -251,12 +319,14 @@ static void HotkeyThread()
                 CreateThread(NULL, 0,
                     [](LPVOID) -> DWORD { AutoGreenThread(); return 0; },
                     NULL, 0, NULL);
-                Log("F8: Auto-green ENABLED (Detours vibration mode)");
+                Log("F8: Auto-green ENABLED");
             }
         }
         if (GetAsyncKeyState(VK_F9) & 1) {
             Log("=== F9: STATE DUMP ===");
             Log("  Auto-green: %s", g_AutoGreen.load() ? "ON" : "OFF");
+            Log("  Mode: %s", g_TimerMode.load() ? "TIMER" : "VIBRATION");
+            Log("  Timer delay: %d ms", g_ReleaseDelayMs.load());
             Log("  Shots: %d", g_ShotsTaken.load());
             Log("  Hook: %s", g_Hooked ? "YES" : "NO");
             Log("  Last motors: L=%u R=%u", g_LastLeftMotor.load(), g_LastRightMotor.load());
@@ -292,11 +362,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(hModule);
         g_Module = hModule;
         LogInit();
-        Log("autogreen.dll v6 loaded (DETOURS MODE) - pid %u", GetCurrentProcessId());
+        Log("autogreen.dll v7 loaded (TIMER+VIBRATION) - pid %u", GetCurrentProcessId());
         g_Thread = CreateThread(NULL, 0,
             [](LPVOID) -> DWORD { HotkeyThread(); return 0; },
             NULL, 0, NULL);
-        Log("Ready! Press F8 to enable auto-green.");
+        Log("Ready! Press F8 to enable. F5/F6 to adjust timer. F7 to switch mode.");
         break;
 
     case DLL_PROCESS_DETACH:
