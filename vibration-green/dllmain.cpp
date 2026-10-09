@@ -186,12 +186,12 @@ static void AutoGreenThread()
 
                 if (pEnable) {
                     pEnable(FALSE);
-                    Sleep(80);
+                    Sleep(30);
                     pEnable(TRUE);
                     Log("Released via XInputEnable");
                 }
 
-                Sleep(300);
+                Sleep(200);
             }
         }
         Sleep(1);
